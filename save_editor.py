@@ -7,6 +7,7 @@
 
 import json
 import os
+import re
 import shutil
 import logging
 import glob
@@ -149,8 +150,11 @@ class SaveEditor:
     def __init__(self):
         self.save_dir: Optional[str] = None
         self.save_data: Dict[str, Any] = {}
+        self._raw_text: str = ""            # 原始文本（做正则替换用）
         self.current_save_path: Optional[str] = None
         self._backup_path: Optional[str] = None
+        self._has_bom: bool = False         # 是否有 BOM
+        self._pending_changes: Dict[str, Any] = {}  # 字段路径 → 新值
 
     # ── 存档路径管理 ──────────────────────────────────────────────────
 
@@ -200,25 +204,43 @@ class SaveEditor:
     # ── 读写存档 ──────────────────────────────────────────────────────
 
     def load_save(self, filepath: str) -> bool:
-        """加载存档文件。"""
+        """加载存档文件（保留原始格式）。"""
         try:
-            with open(filepath, "r", encoding="utf-8-sig") as f:
-                self.save_data = json.load(f)
+            # 检测 BOM
+            with open(filepath, "rb") as f:
+                raw = f.read()
+            self._has_bom = raw[:3] == b'\xef\xbb\xbf'
+            encoding = "utf-8-sig" if self._has_bom else "utf-8"
+            self._raw_text = raw.decode(encoding)
+            self.save_data = json.loads(self._raw_text)
             self.current_save_path = filepath
-            logger.info(f"已加载存档: {filepath}")
+            self._pending_changes = {}
+            logger.info(f"已加载存档: {filepath} (BOM={self._has_bom})")
             return True
-        except json.JSONDecodeError as e:
-            logger.error(f"存档 JSON 解析失败: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"读取存档失败: {e}")
+        except (json.JSONDecodeError, Exception) as e:
+            logger.error(f"读取/解析存档失败: {e}")
             return False
 
+    def _queue_change(self, field_path: str, new_value: Any):
+        """记录一次待执行的修改。"""
+        self._pending_changes[field_path] = new_value
+
+    def _get_field_pattern(self, field: str) -> re.Pattern:
+        """生成匹配 JSON 字段值的正则。"""
+        return re.compile(
+            r'("' + re.escape(field) + r'"\s*:\s*)(-?\d+(?:\.\d+)?|"[^"]*"|true|false|null)'
+        )
+
     def save(self, filepath: str = None) -> bool:
-        """写回存档文件，自动创建备份。"""
+        """
+        写回存档——只替换待修改的字段值，完全保留原始格式。
+        """
         target = filepath or self.current_save_path
         if not target:
             logger.error("未指定存档路径")
+            return False
+        if not self._raw_text:
+            logger.error("没有原始文本缓存，请先 load_save")
             return False
 
         # 创建备份
@@ -231,12 +253,36 @@ class SaveEditor:
             logger.warning(f"备份创建失败: {e}")
 
         try:
-            with open(target, "w", encoding="utf-8") as f:
-                json.dump(self.save_data, f, ensure_ascii=False, indent=2)
-            logger.info(f"存档已保存: {target}")
+            modified = self._raw_text
+
+            # 逐条应用修改
+            for field_path, new_val in self._pending_changes.items():
+                # 取路径的最后一段作为字段名（如 RoleData.0.iStr → iStr）
+                # 正则会全局替换所有匹配的字段，对"全角色最大化"来说这是期望行为
+                field = field_path.rsplit(".", 1)[-1]
+                pattern = self._get_field_pattern(field)
+
+                def replacer(m, val=new_val):
+                    return m.group(1) + str(val)
+
+                modified = pattern.sub(replacer, modified)
+                logger.info(f"  替换: {field} → {new_val}")
+
+            # 更新缓存
+            encoding = "utf-8-sig" if self._has_bom else "utf-8"
+            with open(target, "w", encoding=encoding, newline="") as f:
+                f.write(modified)
+
+            self._raw_text = modified
+            self.save_data = json.loads(modified)
+            self._pending_changes = {}
+
+            logger.info(f"✅ 存档已保存（格式保留模式）: {target}")
             return True
         except Exception as e:
             logger.error(f"保存存档失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
     def restore_backup(self) -> bool:
@@ -275,13 +321,13 @@ class SaveEditor:
         return data
 
     def set_value(self, field_path: str, value: Any) -> bool:
-        """按路径设置值。"""
+        """按路径设置值（同时更新缓存和变更追踪）。"""
+        # 更新 save_data 用于 UI 显示
         parts = field_path.split(".")
         data = self.save_data
         for part in parts[:-1]:
             if isinstance(data, dict):
                 if part not in data:
-                    # 自动创建中间字典
                     data[part] = {}
                 data = data[part]
             elif isinstance(data, list):
@@ -296,15 +342,17 @@ class SaveEditor:
         last_key = parts[-1]
         if isinstance(data, dict):
             data[last_key] = value
-            return True
         elif isinstance(data, list):
             try:
-                idx = int(last_key)
-                data[idx] = value
-                return True
+                data[int(last_key)] = value
             except (ValueError, IndexError):
                 return False
-        return False
+        else:
+            return False
+
+        # 记录待写入的变更
+        self._queue_change(field_path, value)
+        return True
 
     # ── 快速修改工具 ──────────────────────────────────────────────────
 
@@ -334,14 +382,17 @@ class SaveEditor:
             return False
 
         if role_index is not None:
-            targets = [role_data[role_index]] if role_index < len(role_data) else []
+            targets = [(role_index, role_data[role_index])] if role_index < len(role_data) else []
         else:
-            targets = role_data
+            targets = [(i, r) for i, r in enumerate(role_data)]
 
-        for role in targets:
+        for idx, role in targets:
             if isinstance(role, dict):
                 for field, value in (field_updates or {}).items():
-                    role[field] = value
+                    # 只修改已存在的字段，不添加新字段
+                    if field in role:
+                        role[field] = value
+                        self._queue_change(f"RoleData.{idx}.{field}", value)
 
         return True
 
@@ -367,7 +418,7 @@ class SaveEditor:
         return roles
 
     def max_roles_stats(self):
-        """将所有角色属性最大化。"""
+        """将所有角色属性最大化（仅修改已存在的字段）。"""
         return self.edit_roles(field_updates={
             "iStr": 999,
             "iInt": 999,
@@ -379,9 +430,6 @@ class SaveEditor:
             "iSp": 99999,
             "iAttack": 9999,
             "iDefense": 9999,
-            "iDodge": 999,
-            "iCrit": 999,
-            "iCounterAttack": 999,
         })
 
     # ── 存档数据分析 ──────────────────────────────────────────────────
